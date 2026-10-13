@@ -8,7 +8,8 @@ Protocol: DRGB V4 over USB HID
   - VID: 0x2486, PID: 0x3216 (AG-DRGB16)
   - 16 channels (A1-A8, B1-B8), up to 256 addressable LEDs per channel
   - 1025-byte HID reports with multi-packet support for large payloads
-  - Requires keepalive packets every ~500ms to stay in direct mode
+  - Optional keepalive packet (0x65) every ~500ms; the vendor driver sends
+    it, but testing shows it isn't needed for direct mode
 
 Typical usage:
     from airgoo import AirgooController
@@ -16,24 +17,29 @@ Typical usage:
     ctrl = AirgooController()              # auto-detects /dev/hidraw path
     ctrl.set_zone(15, [(255, 0, 0)] * 24)  # zone 15 = B8, 24 red LEDs
     ctrl.update()                          # sends to hardware
-    ctrl.run_keepalive()                   # blocks, sends keepalive loop
 
 For animation:
     ctrl = AirgooController()
     ctrl.set_zone(15, [(255, 0, 0)] * 24)
-    ctrl.start_keepalive()                 # background thread
+    ctrl.update()
     ...
     ctrl.set_zone(15, new_colors)
     ctrl.update()
     ...
     ctrl.stop()                            # cleanup
+
+Optional keepalive (only if the controller reverts to its built-in pattern):
+    ctrl.start_keepalive()                 # background thread
+    ctrl.run_keepalive()                   # or: block, sending until Ctrl+C
 """
 
 import os
 import glob
 import struct
+import sys
 import threading
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -46,8 +52,8 @@ REPORT_SIZE = 1025           # 1 byte report ID + 1024 bytes payload
 REPORT_SIZE_SMALL = 65       # for keepalive packets
 PAYLOAD_FIRST = 1020         # usable bytes in first packet (1024 - 4 header bytes)
 PAYLOAD_NEXT = 1020          # usable bytes in subsequent packets
-LEDS_FIRST = 316             # floor((1024 - 5 - 72) / 3) LEDs in first packet
-LEDS_NEXT = 339              # floor((1024 - 5) / 3) LEDs in subsequent packets
+LEDS_FIRST = 316             # (1020 - 72 header bytes) / 3 LEDs in first packet (256 + 60 in the count bytes)
+LEDS_NEXT = 340              # 1020 / 3 LEDs in subsequent packets (vendor DRGB_V4_PACKAGE_SIZE)
 HEADER_SIZE = 72             # 2 bytes per zone × 36 max zones
 MAX_ZONES = 16               # AG-DRGB16 has 16 zones
 MAX_LEDS_PER_ZONE = 256
@@ -63,17 +69,70 @@ ZONE_NAMES = {
 }
 
 
+class MultipleDevicesError(Exception):
+    """More than one Airgoo controller found and none was selected."""
+
+
+@dataclass
+class HidrawDevice:
+    path: str
+    vid: int
+    pid: int
+    name: str
+    serial: str
+    phys: str
+
+    @property
+    def is_airgoo(self) -> bool:
+        return self.vid == AIRGOO_VID and self.pid == AIRGOO_AG_DRGB16_PID
+
+    def describe(self) -> str:
+        return f"{self.path}  {self.name}  serial={self.serial or '-'}  {self.phys}"
+
+
+def list_hidraw_devices() -> list[HidrawDevice]:
+    """List every /dev/hidraw* device, using sysfs metadata (no open needed)."""
+    devices = []
+    paths = [p for p in glob.glob("/dev/hidraw*") if p[len("/dev/hidraw"):].isdigit()]
+    for path in sorted(paths, key=lambda p: int(p[len("/dev/hidraw"):])):
+        uevent = f"/sys/class/hidraw/{os.path.basename(path)}/device/uevent"
+        try:
+            with open(uevent) as f:
+                info = dict(line.strip().split("=", 1) for line in f if "=" in line)
+            # HID_ID looks like "0003:00002486:00003216" (bus:vid:pid)
+            _, vid, pid = info["HID_ID"].split(":")
+            devices.append(HidrawDevice(
+                path=path,
+                vid=int(vid, 16),
+                pid=int(pid, 16),
+                name=info.get("HID_NAME", ""),
+                serial=info.get("HID_UNIQ", ""),
+                phys=info.get("HID_PHYS", ""),
+            ))
+        except (OSError, KeyError, ValueError):
+            continue
+    return devices
+
+
+def find_airgoo_devices(serial: Optional[str] = None) -> list[HidrawDevice]:
+    """List attached Airgoo controllers, optionally only the one with this serial."""
+    return [
+        d for d in list_hidraw_devices()
+        if d.is_airgoo and (serial is None or d.serial == serial)
+    ]
+
+
 class AirgooController:
     """
     Direct HID driver for Airgoo AG-DRGB16 LED controllers.
 
     The controller uses the DRGB V4 protocol. Key behaviors:
-      - All zones must be present in every update packet (even if empty).
-        The controller ignores packets where some zones have data and others
-        don't. Set unused zones to 0 LEDs.
-      - The controller reverts to its built-in pattern if it doesn't receive
-        a keepalive packet within ~500ms. Use start_keepalive() for a
-        background thread, or call send_keepalive() manually.
+      - All 16 zones are present in every update; zones with no LEDs set
+        are sent with a count of 0.
+      - Keepalive is optional and off by default. The vendor driver sends a
+        keepalive every 500ms, but it hasn't been needed in testing. If the
+        controller reverts to its built-in pattern, use start_keepalive()
+        for a background thread, or call send_keepalive() manually.
       - Data is sent as 1025-byte HID reports. Payloads larger than 1020
         bytes are split across multiple packets automatically.
 
@@ -81,56 +140,74 @@ class AirgooController:
     interrupted. If writes fail, call reconnect() to re-detect the device.
     """
 
-    def __init__(self, hidraw_path: Optional[str] = None):
+    def __init__(self, hidraw_path: Optional[str] = None, serial: Optional[str] = None):
         """
         Open the Airgoo controller.
 
         Args:
-            hidraw_path: Path to hidraw device (e.g. "/dev/hidraw0").
-                         Auto-detected if not specified.
+            hidraw_path: Path to hidraw device (e.g. "/dev/hidraw1").
+            serial: Serial number of the controller to use (see
+                    find_airgoo_devices()). Ignored if hidraw_path is given.
+
+        If neither is given, the controller is auto-detected by USB VID/PID.
+        Raises MultipleDevicesError if more than one is attached.
         """
         self._fd: Optional[int] = None
+        self._serial: Optional[str] = None
         self._zones: list[list[tuple[int, int, int]]] = [[] for _ in range(MAX_ZONES)]
         self._keepalive_thread: Optional[threading.Thread] = None
         self._keepalive_running = False
         self._lock = threading.Lock()
 
-        path = hidraw_path or self._find_device()
+        path = hidraw_path or self._find_device(serial)
         if path is None:
             raise FileNotFoundError(
                 "No Airgoo controller found. Check USB connection and "
                 "/dev/hidraw permissions. See README for udev rules."
             )
+        self._open(path)
+
+    @staticmethod
+    def _find_device(serial: Optional[str] = None) -> Optional[str]:
+        """
+        Auto-detect the hidraw device for the Airgoo controller.
+
+        Returns None if none is found. Raises MultipleDevicesError if several
+        match, rather than guessing.
+        """
+        matches = find_airgoo_devices(serial)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            listing = "\n".join(f"  {d.describe()}" for d in matches)
+            raise MultipleDevicesError(
+                f"{len(matches)} Airgoo controllers found; select one with "
+                f"a hidraw path or serial:\n{listing}"
+            )
+        return matches[0].path
+
+    def _open(self, path: str):
         self._path = path
         self._fd = os.open(path, os.O_RDWR)
-
-    def _find_device(self) -> Optional[str]:
-        """Auto-detect the hidraw device for the Airgoo controller."""
-        for path in sorted(glob.glob("/dev/hidraw*")):
-            try:
-                sysfs = f"/sys/class/hidraw/{os.path.basename(path)}/device/uevent"
-                if os.path.exists(sysfs):
-                    with open(sysfs) as f:
-                        content = f.read()
-                    vid_pid = f"{AIRGOO_VID:04X}:{AIRGOO_AG_DRGB16_PID:04X}"
-                    if vid_pid in content:
-                        return path
-            except (OSError, PermissionError):
-                continue
-
-        # Fallback: try hidraw0 if sysfs isn't available
-        for path in sorted(glob.glob("/dev/hidraw*")):
-            return path
-        return None
+        # Remember which physical controller this is, so reconnect() can find
+        # it again even if the hidraw number changes.
+        self._serial = next(
+            (d.serial for d in list_hidraw_devices() if d.path == path and d.serial),
+            None,
+        )
 
     def reconnect(self, hidraw_path: Optional[str] = None):
-        """Re-open the device after USB reset or disconnection."""
+        """
+        Re-open the device after USB reset or disconnection.
+
+        Without a path, re-finds the same controller by serial number (the
+        hidraw number can change after a rebind).
+        """
         self.close()
-        path = hidraw_path or self._find_device()
+        path = hidraw_path or self._find_device(self._serial)
         if path is None:
             raise FileNotFoundError("No Airgoo controller found.")
-        self._path = path
-        self._fd = os.open(path, os.O_RDWR)
+        self._open(path)
 
     # ── Zone management ──────────────────────────────────────────────
 
@@ -196,30 +273,18 @@ class AirgooController:
 
     # ── Protocol ─────────────────────────────────────────────────────
 
-    # Minimum LEDs to report per zone. The controller silently ignores
-    # updates where any zone has 0 LEDs — all zones must carry data.
-    # Zones with no user-set LEDs get this many black (off) LEDs.
-    MIN_LEDS_PER_ZONE = 1
-
     def update(self):
         """
         Send current zone state to the controller.
 
         Builds the V4 protocol packet(s) and writes to HID. All 16 zones
-        are included in every update. Zones with no LEDs set are padded
-        with black (off) pixels — the controller requires all zones to
-        carry data or it silently ignores the entire update.
+        are included in every update; zones with no LEDs set are sent with
+        a count of 0.
         """
         if self._fd is None:
             raise RuntimeError("Device not open. Call reconnect().")
 
-        # Build effective zone data — pad empty zones with black pixels
-        effective = []
-        for z in range(MAX_ZONES):
-            if self._zones[z]:
-                effective.append(self._zones[z])
-            else:
-                effective.append([(0, 0, 0)] * self.MIN_LEDS_PER_ZONE)
+        effective = self._zones
 
         # Count total LEDs
         total_leds = sum(len(z) for z in effective)
@@ -368,11 +433,16 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Airgoo AG-DRGB16 LED Controller")
-    parser.add_argument("--device", "-d", help="hidraw device path (auto-detected if omitted)")
+    parser.add_argument("--device", "-d", help="hidraw device path, e.g. /dev/hidraw1 (auto-detected if omitted)")
+    parser.add_argument("--serial", "-s", help="select the controller with this serial number")
+    parser.add_argument("--list-devices", action="store_true",
+                        help="List hidraw devices (Airgoo controllers marked with *) and exit")
     parser.add_argument("--zone", "-z", type=int, help="Zone index 0-15 (default: all)")
     parser.add_argument("--zone-name", "-n", help="Zone name like A1, B8")
     parser.add_argument("--color", "-c", default="FF0000", help="Hex color (default: FF0000)")
     parser.add_argument("--leds", "-l", type=int, default=24, help="LEDs per zone (default: 24)")
+    parser.add_argument("--keepalive", "-k", action="store_true",
+                        help="Stay running and send keepalive packets until Ctrl+C")
     parser.add_argument("--list-zones", action="store_true", help="List zone names and exit")
     args = parser.parse_args()
 
@@ -381,11 +451,19 @@ def main():
             print(f"  {idx:2d}: {name}")
         return
 
+    if args.list_devices:
+        for d in list_hidraw_devices():
+            print(f"{'*' if d.is_airgoo else ' '} {d.describe()}")
+        return
+
     r = int(args.color[0:2], 16)
     g = int(args.color[2:4], 16)
     b = int(args.color[4:6], 16)
 
-    ctrl = AirgooController(hidraw_path=args.device)
+    try:
+        ctrl = AirgooController(hidraw_path=args.device, serial=args.serial)
+    except (FileNotFoundError, MultipleDevicesError) as e:
+        sys.exit(str(e))
 
     if args.zone_name:
         ctrl.set_zone_by_name(args.zone_name, [(r, g, b)] * args.leds)
@@ -395,8 +473,12 @@ def main():
         ctrl.fill_all(r, g, b, args.leds)
 
     ctrl.update()
-    print(f"Color #{args.color} sent. Keepalive running (Ctrl+C to stop)...")
-    ctrl.run_keepalive()
+    if args.keepalive:
+        print(f"Color #{args.color} sent. Keepalive running (Ctrl+C to stop)...")
+        ctrl.run_keepalive()
+    else:
+        print(f"Color #{args.color} sent.")
+    ctrl.close()
 
 
 if __name__ == "__main__":
