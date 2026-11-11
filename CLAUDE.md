@@ -2,7 +2,7 @@
 
 ## What this is
 
-Python driver for the Airgoo AG-DRGB16 16-channel addressable RGB LED controller. Communicates via USB HID (`/dev/hidraw`) using the DRGB V4 protocol. No external dependencies.
+Python driver for the Airgoo AG-DRGB16 16-channel addressable RGB LED controller and the 8-port AG-DRGB08. Communicates via USB HID (`/dev/hidraw`) using the DRGB V4 protocol. No external dependencies.
 
 ## Architecture
 
@@ -14,8 +14,8 @@ Single file driver (`airgoo.py`) with:
 
 ## Key protocol details
 
-- **VID/PID**: `0x2486:0x3216`
-Source of truth: the vendor's OpenRGB driver files in `../Airgoo Source/` (from OpenRGB issue #4878). Both PIDs (0x3204 AG-DRGB04 = 4 channels, 0x3216 AG-DRGB16 = 16 channels) use protocol V4.
+- **VID/PID**: `0x2486:0x3216` (AG-DRGB16), `0x2486:0x3f08` (AG-DRGB08). Supported models and their port names are in `MODELS`; the controller's `model`, `zone_count` and `zone_names` come from the PID.
+Source of truth: the vendor's OpenRGB driver files in `../Airgoo Source/` (from OpenRGB issue #4878). Both PIDs (0x3204 AG-DRGB04 = 4 channels, 0x3216 AG-DRGB16 = 16 channels) use protocol V4. The AG-DRGB08 (0x3f08) isn't in the vendor files, but it has the same 1024-byte HID reports and accepts the same V4 frames: verified 2026-11-11 by lighting port 5 via zone 4 with all 16 zone counts sent. The AG-DRGB04 is not in `MODELS` (untested).
 
 - **Keepalive is optional**: a 65-byte report with `0x65` in byte 1 every ~500ms. The vendor driver sends it ("exit hardware effects"), but it has not been needed in testing. Off by default; opt in with `start_keepalive()` / `run_keepalive()` or the CLI `--keepalive` flag.
 - **Packet format**: 1025-byte HID reports. Byte 0 = report ID (0x00), byte 1 = `100 + packet_index`, byte 2 = `total_packets + 99`, bytes 3-4 = LED count carried in *this* packet (high, low), bytes 5-1024 = 1020 data bytes.

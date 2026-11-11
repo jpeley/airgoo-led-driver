@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "airgoo"
-version = "0.1.0"
-description = "Direct HID driver for the Airgoo AG-DRGB16 LED controller"
+version = "0.2.0"
+description = "Direct HID driver for the Airgoo AG-DRGB16 and AG-DRGB08 LED controllers"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 

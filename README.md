@@ -1,6 +1,6 @@
 # airgoo-led-driver
 
-Python driver for the [Airgoo AG-DRGB16](https://www.amazon.com/Airgoo-16-Port-Signal-Controller-Configuration/dp/B0F3VV65WD) 16-channel addressable RGB LED controller. Talks directly to the hardware via USB HID — no OpenRGB, SignalRGB, or Windows required.
+Python driver for the [Airgoo AG-DRGB16](https://www.amazon.com/Airgoo-16-Port-Signal-Controller-Configuration/dp/B0F3VV65WD) 16-channel addressable RGB LED controller, and its 8-port sibling the AG-DRGB08. Talks directly to the hardware via USB HID — no OpenRGB, SignalRGB, or Windows required.
 
 ## Why this exists
 
@@ -10,10 +10,10 @@ The AG-DRGB16 is marketed as OpenRGB-compatible, but as of March 2026 the driver
 
 | Detail | Value |
 |--------|-------|
-| Controller | Airgoo AG-DRGB16 |
-| Connection | USB 2.0 HID (VID `0x2486`, PID `0x3216`) |
+| Controller | Airgoo AG-DRGB16 or AG-DRGB08 |
+| Connection | USB 2.0 HID (VID `0x2486`, PID `0x3216` AG-DRGB16, `0x3f08` AG-DRGB08) |
 | Power | SATA (LED power), USB (data only) |
-| Channels | 16 (A1-A8, B1-B8) |
+| Channels | AG-DRGB16: 16 (A1-A8, B1-B8); AG-DRGB08: 8 (1-8, zones 0-7) |
 | LEDs per channel | Up to 256 addressable (WS2812B, SK6812, etc.) |
 | Protocol | DRGB V4 |
 
@@ -94,6 +94,7 @@ sudo tee /etc/udev/rules.d/60-airgoo.rules << 'EOF'
 # Airgoo DRGB controllers
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2486", ATTRS{idProduct}=="3216", MODE="0666"
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2486", ATTRS{idProduct}=="3204", MODE="0666"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2486", ATTRS{idProduct}=="3f08", MODE="0666"
 EOF
 sudo udevadm control --reload-rules
 sudo udevadm trigger
@@ -123,11 +124,12 @@ The DRGB V4 protocol sends all zone data in a single bulk update:
 3. **Packetized**: 1025-byte HID reports (1 byte report ID + 1024 payload). First packet carries 1020 bytes of data, subsequent packets carry 1020 bytes each.
 4. **Keepalive**: A 65-byte packet with byte 1 = `0x65` must be sent every ~500ms or the controller reverts to its built-in pattern.
 
-**Critical quirk**: The controller ignores updates where only some zones have data. Every update must include all 16 zones in the header, even if most have 0 LEDs. This is why OpenRGB's per-zone CLI path doesn't work with this controller.
+**Critical quirk**: The controller ignores updates where only some zones have data. Every update must include all 16 zones in the header (on the AG-DRGB08 too; it uses the first 8), even if most have 0 LEDs. This is why OpenRGB's per-zone CLI path doesn't work with this controller.
 
 ## Tested hardware
 
 - Airgoo AG-DRGB16 (firmware as of March 2026)
+- Airgoo AG-DRGB08 (bcdDevice 1.00, Nov 2026): same DRGB V4 protocol and 1024-byte reports; ports 1-8 are zones 0-7. Ubuntu 26.04, kernel 7.0.
 - BTF-LIGHTING WS2812B strips
 - Debian 12 (Bookworm), kernel 6.12
 

@@ -5,8 +5,9 @@ Direct HID control for Airgoo AG-DRGB16 (and related DRGB V4 controllers)
 without requiring OpenRGB. Talks to the controller via /dev/hidraw.
 
 Protocol: DRGB V4 over USB HID
-  - VID: 0x2486, PID: 0x3216 (AG-DRGB16)
-  - 16 channels (A1-A8, B1-B8), up to 256 addressable LEDs per channel
+  - VID: 0x2486, PID: 0x3216 (AG-DRGB16) or 0x3F08 (AG-DRGB08)
+  - AG-DRGB16: 16 channels (A1-A8, B1-B8); AG-DRGB08: 8 channels (1-8),
+    up to 256 addressable LEDs per channel
   - 1025-byte HID reports with multi-packet support for large payloads
   - Optional keepalive packet (0x65) every ~500ms; the vendor driver sends
     it, but testing shows it isn't needed for direct mode
@@ -46,6 +47,7 @@ from typing import Optional
 # USB identifiers
 AIRGOO_VID = 0x2486
 AIRGOO_AG_DRGB16_PID = 0x3216
+AIRGOO_AG_DRGB08_PID = 0x3F08
 
 # Protocol constants
 REPORT_SIZE = 1025           # 1 byte report ID + 1024 bytes payload
@@ -69,6 +71,28 @@ ZONE_NAMES = {
 }
 
 
+@dataclass(frozen=True)
+class Model:
+    """A supported controller: its name and the ports it has, in zone order."""
+
+    name: str
+    zone_names: tuple[str, ...]
+
+    @property
+    def zone_count(self) -> int:
+        return len(self.zone_names)
+
+
+# Controllers that speak DRGB V4, by USB product ID. Every update carries all
+# MAX_ZONES zone slots; a controller with fewer ports uses the first ones (the
+# AG-DRGB08's ports 1-8 are zones 0-7, verified on hardware 2026-11-11).
+MODELS = {
+    AIRGOO_AG_DRGB16_PID: Model("AG-DRGB16", tuple(ZONE_NAMES[z] for z in range(16))),
+    AIRGOO_AG_DRGB08_PID: Model("AG-DRGB08", tuple(str(n) for n in range(1, 9))),
+}
+DEFAULT_MODEL = MODELS[AIRGOO_AG_DRGB16_PID]
+
+
 class MultipleDevicesError(Exception):
     """More than one Airgoo controller found and none was selected."""
 
@@ -84,7 +108,11 @@ class HidrawDevice:
 
     @property
     def is_airgoo(self) -> bool:
-        return self.vid == AIRGOO_VID and self.pid == AIRGOO_AG_DRGB16_PID
+        return self.vid == AIRGOO_VID and self.pid in MODELS
+
+    @property
+    def model(self) -> Optional[Model]:
+        return MODELS.get(self.pid) if self.vid == AIRGOO_VID else None
 
     def describe(self) -> str:
         return f"{self.path}  {self.name}  serial={self.serial or '-'}  {self.phys}"
@@ -154,6 +182,7 @@ class AirgooController:
         """
         self._fd: Optional[int] = None
         self._serial: Optional[str] = None
+        self.model: Model = DEFAULT_MODEL
         self._zones: list[list[tuple[int, int, int]]] = [[] for _ in range(MAX_ZONES)]
         self._keepalive_thread: Optional[threading.Thread] = None
         self._keepalive_running = False
@@ -190,11 +219,20 @@ class AirgooController:
         self._path = path
         self._fd = os.open(path, os.O_RDWR)
         # Remember which physical controller this is, so reconnect() can find
-        # it again even if the hidraw number changes.
-        self._serial = next(
-            (d.serial for d in list_hidraw_devices() if d.path == path and d.serial),
-            None,
-        )
+        # it again even if the hidraw number changes, and which model it is.
+        info = next((d for d in list_hidraw_devices() if d.path == path), None)
+        self._serial = info.serial if info and info.serial else None
+        self.model = (info.model if info else None) or DEFAULT_MODEL
+
+    @property
+    def zone_count(self) -> int:
+        """How many ports this controller has (zones 0 to zone_count-1)."""
+        return self.model.zone_count
+
+    @property
+    def zone_names(self) -> tuple[str, ...]:
+        """Port names in zone order, e.g. ("A1", ..., "B8") or ("1", ..., "8")."""
+        return self.model.zone_names
 
     def reconnect(self, hidraw_path: Optional[str] = None):
         """
@@ -231,18 +269,19 @@ class AirgooController:
 
     def set_zone_by_name(self, name: str, colors: list[tuple[int, int, int]]):
         """
-        Set LED colors by zone name (e.g. "B8", "A1").
+        Set LED colors by port name (e.g. "B8", "A1" on an AG-DRGB16, "5" on
+        an AG-DRGB08).
 
         Args:
-            name: Zone name like "A1" through "A8" or "B1" through "B8".
+            name: Port name, one of zone_names.
             colors: List of (R, G, B) tuples.
         """
         name_upper = name.upper()
-        for idx, zname in ZONE_NAMES.items():
+        for idx, zname in enumerate(self.zone_names):
             if zname == name_upper:
                 self.set_zone(idx, colors)
                 return
-        raise ValueError(f"Unknown zone name: {name}. Valid: {list(ZONE_NAMES.values())}")
+        raise ValueError(f"Unknown zone name: {name}. Valid: {list(self.zone_names)}")
 
     def clear_zone(self, zone: int):
         """Clear all LEDs on a zone (set to 0 LEDs)."""
@@ -432,13 +471,14 @@ def main():
     """Quick test: fill all zones with dim white."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Airgoo AG-DRGB16 LED Controller")
+    parser = argparse.ArgumentParser(description="Airgoo AG-DRGB16 / AG-DRGB08 LED Controller")
     parser.add_argument("--device", "-d", help="hidraw device path, e.g. /dev/hidraw1 (auto-detected if omitted)")
     parser.add_argument("--serial", "-s", help="select the controller with this serial number")
     parser.add_argument("--list-devices", action="store_true",
                         help="List hidraw devices (Airgoo controllers marked with *) and exit")
-    parser.add_argument("--zone", "-z", type=int, help="Zone index 0-15 (default: all)")
-    parser.add_argument("--zone-name", "-n", help="Zone name like A1, B8")
+    parser.add_argument("--zone", "-z", type=int,
+                        help="Zone index, 0-15 on an AG-DRGB16, 0-7 on an AG-DRGB08 (default: all)")
+    parser.add_argument("--zone-name", "-n", help="Port name: A1-B8 on an AG-DRGB16, 1-8 on an AG-DRGB08")
     parser.add_argument("--color", "-c", default="FF0000", help="Hex color (default: FF0000)")
     parser.add_argument("--leds", "-l", type=int, default=24, help="LEDs per zone (default: 24)")
     parser.add_argument("--keepalive", "-k", action="store_true",
@@ -447,8 +487,10 @@ def main():
     args = parser.parse_args()
 
     if args.list_zones:
-        for idx, name in sorted(ZONE_NAMES.items()):
-            print(f"  {idx:2d}: {name}")
+        for model in MODELS.values():
+            print(f"{model.name}:")
+            for idx, name in enumerate(model.zone_names):
+                print(f"  {idx:2d}: {name}")
         return
 
     if args.list_devices:
@@ -468,9 +510,12 @@ def main():
     if args.zone_name:
         ctrl.set_zone_by_name(args.zone_name, [(r, g, b)] * args.leds)
     elif args.zone is not None:
+        if not 0 <= args.zone < ctrl.zone_count:
+            sys.exit(f"{ctrl.model.name} zones are 0-{ctrl.zone_count - 1}")
         ctrl.set_zone(args.zone, [(r, g, b)] * args.leds)
     else:
-        ctrl.fill_all(r, g, b, args.leds)
+        for z in range(ctrl.zone_count):
+            ctrl.fill_zone(z, r, g, b, args.leds)
 
     ctrl.update()
     if args.keepalive:
